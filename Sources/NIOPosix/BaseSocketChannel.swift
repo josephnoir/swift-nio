@@ -893,7 +893,7 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
         self.eventLoop.assertInEventLoop()
 
         if self.lifecycleManager.isCurrentlyActivating {
-            // Selay closing while the channel is still in the process of activation.
+            // Delay closing while the channel is still in the process of activation.
             self.eventLoop.execute {
                 self.close0(error: error, mode: mode, promise: promise)
             }
@@ -1409,7 +1409,8 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
 
         self.lifecycleManager.beginActivation()(promise, self.pipeline)
 
-        // The promise above was fulfilled. Move to the next state.
+        // We have to state transitions to avoid closing the channel before the channelActive event was delivered.
+        // Now that the event was fired, we finish activation and allow close0 to close the channel directly.
         self.lifecycleManager.finishActivation()(nil, self.pipeline)
 
         guard self.lifecycleManager.isOpen else {
