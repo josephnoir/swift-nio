@@ -184,11 +184,11 @@ private struct SocketChannelLifecycleManager {
             (.preRegistered, .finishActivation),  // need to begin activation first
             (.fullyRegistered, .beginRegistration),  // already registered
             (.fullyRegistered, .finishActivation),  // need to begin activation first
-            (.activating, .beginActivation), // already in the process
-            (.activating, .beginRegistration),   // already fully registered
-            (.activating, .finishRegistration),   // already fully registered
-            (.activating, .close),   // needs to be delayed until activated
-            (.activated, .beginActivation), // only if reconnect is supported!
+            (.activating, .beginActivation),  // already in the process
+            (.activating, .beginRegistration),  // already fully registered
+            (.activating, .finishRegistration),  // already fully registered
+            (.activating, .close),  // needs to be delayed until activated
+            (.activated, .beginActivation),  // only if reconnect is supported!
             (.activated, .finishActivation),  // already activated
             (.activated, .beginRegistration),  // already fully registered (and activated)
             (.activated, .finishRegistration),  // already fully registered (and activated)
