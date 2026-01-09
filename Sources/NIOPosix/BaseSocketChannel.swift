@@ -852,7 +852,9 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
 
     @inline(__always)
     private func delayClosingWhile(running block: () -> Void) {
-        assert(!self._delayClosing, "delayClosingCalled should not be called recursively")
+        self.eventLoop.assertInEventLoop()
+        assert(!self._delayClosing, "delayClosingWhile should not be called recursively")
+
         self._delayClosing = true
         defer {
             self._delayClosing = false
