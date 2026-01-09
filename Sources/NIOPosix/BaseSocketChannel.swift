@@ -255,6 +255,7 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
     var maxMessagesPerRead: UInt = 4
     private var inFlushNow: Bool = false  // Guard against re-entrance of flushNow() method.
     private var autoRead: Bool = true
+    private var isActivationInProgress: Bool = false
 
     // MARK: Variables that are really constant
     // this is really a constant (set in .init) but needs `self` to be constructed and
@@ -858,6 +859,14 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
     public func close0(error: Error, mode: CloseMode, promise: EventLoopPromise<Void>?) {
         self.eventLoop.assertInEventLoop()
 
+        if self.isActivationInProgress {
+            // Selay closing while the channel is still in the process of activation.
+            self.eventLoop.execute {
+                self.close0(error: error, mode: mode, promise: promise)
+            }
+            return
+        }
+
         guard self.isOpen else {
             promise?.fail(ChannelError._alreadyClosed)
             return
@@ -1364,7 +1373,14 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
                 return
             }
         }
+
+        // We want to avoid closing before activation. This allows us to dely the process.
+        self.isActivationInProgress = true
+
         self.lifecycleManager.activate()(promise, self.pipeline)
+
+        self.isActivationInProgress = false
+
         guard self.lifecycleManager.isOpen else {
             // in the user callout for `channelActive` the channel got closed.
             return
