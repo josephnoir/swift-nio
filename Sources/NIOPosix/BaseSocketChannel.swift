@@ -22,12 +22,14 @@ private struct SocketChannelLifecycleManager {
         case fresh
         case preRegistered  // register() has been run but the selector doesn't know about it yet
         case fullyRegistered  // fully registered, ie. the selector knows about it
+        case activating
         case activated
         case closed
     }
 
     private enum Event {
-        case activate
+        case beginActivation
+        case finishActivation
         case beginRegistration
         case finishRegistration
         case close
@@ -50,7 +52,7 @@ private struct SocketChannelLifecycleManager {
         didSet {
             self.eventLoop.assertInEventLoop()
             switch (oldValue, self.currentState) {
-            case (_, .activated):
+            case (_, .activating):
                 self.isActiveAtomic.store(true, ordering: .relaxed)
             case (.activated, _):
                 self.isActiveAtomic.store(false, ordering: .relaxed)
@@ -97,8 +99,14 @@ private struct SocketChannelLifecycleManager {
 
     // we need to return a closure here and to not suffer from a potential allocation for that this must be inlined
     @inline(__always)
-    internal mutating func activate() -> ((EventLoopPromise<Void>?, ChannelPipeline) -> Void) {
-        self.moveState(event: .activate)
+    internal mutating func beginActivation() -> ((EventLoopPromise<Void>?, ChannelPipeline) -> Void) {
+        self.moveState(event: .beginActivation)
+    }
+
+    // we need to return a closure here and to not suffer from a potential allocation for that this must be inlined
+    @inline(__always)
+    internal mutating func finishActivation() -> ((EventLoopPromise<Void>?, ChannelPipeline) -> Void) {
+        self.moveState(event: .finishActivation)
     }
 
     // MARK: private API
@@ -130,8 +138,8 @@ private struct SocketChannelLifecycleManager {
             }
 
         // origin: .fullyRegistered
-        case (.fullyRegistered, .activate):
-            self.currentState = .activated
+        case (.fullyRegistered, .beginActivation):
+            self.currentState = .activating
             return { promise, pipeline in
                 promise?.succeed(())
                 pipeline.syncOperations.fireChannelActive()
@@ -145,6 +153,13 @@ private struct SocketChannelLifecycleManager {
                 pipeline.syncOperations.fireChannelUnregistered()
             }
 
+        // origin: .activating
+        case (.activating, .finishActivation):
+            self.currentState = .activated
+            return { promise, pipeline in
+                promise?.succeed(())
+            }
+
         // origin: .activated
         case (.activated, .close):
             self.currentState = .closed
@@ -155,17 +170,26 @@ private struct SocketChannelLifecycleManager {
             }
 
         // origin: .activated
-        case (.activated, .activate) where self.supportsReconnect:
+        case (.activated, .beginActivation) where self.supportsReconnect:
+            self.currentState = .activating
             return { promise, pipeline in
                 promise?.succeed(())
             }
 
         // bad transitions
-        case (.fresh, .activate),  // should go through .registered first
-            (.preRegistered, .activate),  // need to first be fully registered
+        case (.fresh, .beginActivation),  // should go through .registered first
+            (.fresh, .finishActivation),  // should go through .registered first
+            (.preRegistered, .beginActivation),  // need to first be fully registered
             (.preRegistered, .beginRegistration),  // already registered
+            (.preRegistered, .finishActivation),  // need to begin activation first
             (.fullyRegistered, .beginRegistration),  // already registered
-            (.activated, .activate),  // already activated
+            (.fullyRegistered, .finishActivation),  // need to begin activation first
+            (.activating, .beginActivation), // already in the process
+            (.activating, .beginRegistration),   // already fully registered
+            (.activating, .finishRegistration),   // already fully registered
+            (.activating, .close),   // needs to be delayed until activated
+            (.activated, .beginActivation), // only if reconnect is supported!
+            (.activated, .finishActivation),  // already activated
             (.activated, .beginRegistration),  // already fully registered (and activated)
             (.activated, .finishRegistration),  // already fully registered (and activated)
             (.fullyRegistered, .finishRegistration),  // already fully registered
@@ -180,9 +204,19 @@ private struct SocketChannelLifecycleManager {
     }
 
     // MARK: convenience properties
+    internal var isCurrentlyActivating: Bool {
+        self.eventLoop.assertInEventLoop()
+        return self.currentState == .activating
+    }
+
     internal var isActive: Bool {
         self.eventLoop.assertInEventLoop()
-        return self.currentState == .activated
+        switch self.currentState {
+        case .fresh, .closed, .preRegistered, .fullyRegistered:
+            return false
+        case .activating, .activated:
+            return true
+        }
     }
 
     internal var isPreRegistered: Bool {
@@ -190,7 +224,7 @@ private struct SocketChannelLifecycleManager {
         switch self.currentState {
         case .fresh, .closed:
             return false
-        case .preRegistered, .fullyRegistered, .activated:
+        case .preRegistered, .fullyRegistered, .activating, .activated:
             return true
         }
     }
@@ -200,7 +234,7 @@ private struct SocketChannelLifecycleManager {
         switch self.currentState {
         case .fresh, .closed, .preRegistered:
             return false
-        case .fullyRegistered, .activated:
+        case .fullyRegistered, .activating, .activated:
             return true
         }
     }
@@ -267,9 +301,6 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
     // PLEASE don't use these directly and use the non-underscored computed properties instead.
     private var _addressCache = AddressCache(local: nil, remote: nil)  // please use `self.addressesCached` instead
     private var _bufferAllocatorCache: ByteBufferAllocator  // please use `self.bufferAllocatorCached` instead.
-    // When this flag is set, a call to close will be delayed. Please use `delayClosingWhile(running:)`
-    // instead of setting this directly. It will ensure that this will always be relased again.
-    private var _delayClosing: Bool = false
 
     // MARK: - Computed properties
     // This is called from arbitrary threads.
@@ -850,18 +881,6 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
         self.safeReregister(interested: self.interestedEvent.subtracting(.read))
     }
 
-    @inline(__always)
-    private func delayClosingWhile(running block: () -> Void) {
-        self.eventLoop.assertInEventLoop()
-        assert(!self._delayClosing, "delayClosingWhile should not be called recursively")
-
-        self._delayClosing = true
-        defer {
-            self._delayClosing = false
-        }
-        block()
-    }
-
     /// Closes the this `BaseChannelChannel` and fulfills `promise` with the result of the _close_ operation.
     /// So unless either the deregistration or the close itself fails, `promise` will be succeeded regardless of
     /// `error`. `error` is used to fail outstanding writes (if any) and the `connectPromise` if set.
@@ -873,7 +892,7 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
     public func close0(error: Error, mode: CloseMode, promise: EventLoopPromise<Void>?) {
         self.eventLoop.assertInEventLoop()
 
-        if self._delayClosing {
+        if self.lifecycleManager.isCurrentlyActivating {
             // Selay closing while the channel is still in the process of activation.
             self.eventLoop.execute {
                 self.close0(error: error, mode: mode, promise: promise)
@@ -1388,10 +1407,10 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
             }
         }
 
-        // We want to avoid closing before activation. This allows us to dely the process.
-        delayClosingWhile {
-            self.lifecycleManager.activate()(promise, self.pipeline)
-        }
+        self.lifecycleManager.beginActivation()(promise, self.pipeline)
+
+        // The promise above was fulfilled. Move to the next state.
+        self.lifecycleManager.finishActivation()(nil, self.pipeline)
 
         guard self.lifecycleManager.isOpen else {
             // in the user callout for `channelActive` the channel got closed.
