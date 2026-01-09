@@ -255,7 +255,6 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
     var maxMessagesPerRead: UInt = 4
     private var inFlushNow: Bool = false  // Guard against re-entrance of flushNow() method.
     private var autoRead: Bool = true
-    private var isActivationInProgress: Bool = false
 
     // MARK: Variables that are really constant
     // this is really a constant (set in .init) but needs `self` to be constructed and
@@ -268,6 +267,9 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
     // PLEASE don't use these directly and use the non-underscored computed properties instead.
     private var _addressCache = AddressCache(local: nil, remote: nil)  // please use `self.addressesCached` instead
     private var _bufferAllocatorCache: ByteBufferAllocator  // please use `self.bufferAllocatorCached` instead.
+    // When this flag is set, a call to close will be delayed. Please use `delayClosingWhile(running:)`
+    // instead of setting this directly. It will ensure that this will always be relased again.
+    private var _delayClosing: Bool = false
 
     // MARK: - Computed properties
     // This is called from arbitrary threads.
@@ -848,6 +850,16 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
         self.safeReregister(interested: self.interestedEvent.subtracting(.read))
     }
 
+    @inline(__always)
+    private func delayClosingWhile(running block: () -> Void) {
+        assert(!self._delayClosing, "delayClosingCalled should not be called recursively")
+        self._delayClosing = true
+        defer {
+            self._delayClosing = false
+        }
+        block()
+    }
+
     /// Closes the this `BaseChannelChannel` and fulfills `promise` with the result of the _close_ operation.
     /// So unless either the deregistration or the close itself fails, `promise` will be succeeded regardless of
     /// `error`. `error` is used to fail outstanding writes (if any) and the `connectPromise` if set.
@@ -859,7 +871,7 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
     public func close0(error: Error, mode: CloseMode, promise: EventLoopPromise<Void>?) {
         self.eventLoop.assertInEventLoop()
 
-        if self.isActivationInProgress {
+        if self._delayClosing {
             // Selay closing while the channel is still in the process of activation.
             self.eventLoop.execute {
                 self.close0(error: error, mode: mode, promise: promise)
@@ -1375,11 +1387,9 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
         }
 
         // We want to avoid closing before activation. This allows us to dely the process.
-        self.isActivationInProgress = true
-
-        self.lifecycleManager.activate()(promise, self.pipeline)
-
-        self.isActivationInProgress = false
+        delayClosingWhile {
+            self.lifecycleManager.activate()(promise, self.pipeline)
+        }
 
         guard self.lifecycleManager.isOpen else {
             // in the user callout for `channelActive` the channel got closed.
